@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">P2P Mesh Network</string>
+    <string name="user_registration">Node Identity</string>
+    <string name="user_name_hint">Enter Your Mesh Peer Name</string>
+    <string name="register_join_mesh">Register &amp; Join Mesh</string>
+    <string name="active_mesh_peers">ACTIVE MESH PEERS</string>
+    <string name="mesh_controls">Mesh Network Controls</string>
+    <string name="start_adv">Start Adv</string>
+    <string name="start_disc">Start Disc</string>
+    <string name="broadcast_sos">Broadcast SOS</string>
+    <string name="simulate_impact">Simulate Impact</string>
+    <string name="send_image">Send Image</string>
+    <string name="audit_log_title">LIVE AUDIT LOG</string>
+    <string name="status_connected">CONNECTED</string>
+    <string name="status_connecting">CONNECTING</string>
+    <string name="status_discovered">DISCOVERED</string>
+    <string name="status_disconnected">DISCONNECTED</string>
+    <string name="private_chat_title">Private Mesh Chat</string>
+    <string name="type_message_hint">Type message...</string>
+    <string name="send">Send</string>
+    <string name="close">Close</string>
+</resources>

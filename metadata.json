@@ -1,0 +1,6 @@
+{
+  "name": "P2P Mesh Network",
+  "description": "Decentralized P2P mesh network app featuring Nearby Connections multi-hop relay, active peer discovery, collision impact detection, and private messaging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
