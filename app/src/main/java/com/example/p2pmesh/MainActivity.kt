@@ -184,7 +184,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
-        override fun onInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+        override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
             connectedPeersMap[endpointId] = connectionInfo.endpointName
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
         }
