@@ -1,594 +1,677 @@
-package com.example.p2pmesh
+package com.example.ss
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.location.Location
+import android.media.MediaPlayer
+import android.media.MediaRecorder
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
-import android.text.format.DateFormat
 import android.util.Base64
-import android.view.LayoutInflater
-import android.view.View
-import android.widget.Button
-import android.widget.EditText
-import android.widget.ImageButton
-import android.widget.ScrollView
-import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.google.android.gms.location.LocationServices
 import com.google.android.gms.nearby.Nearby
-import com.google.android.gms.nearby.connection.AdvertisingOptions
-import com.google.android.gms.nearby.connection.ConnectionInfo
-import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
-import com.google.android.gms.nearby.connection.ConnectionResolution
-import com.google.android.gms.nearby.connection.ConnectionsClient
-import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
-import com.google.android.gms.nearby.connection.DiscoveryOptions
-import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
-import com.google.android.gms.nearby.connection.Payload
-import com.google.android.gms.nearby.connection.PayloadCallback
-import com.google.android.gms.nearby.connection.PayloadTransferUpdate
-import com.google.android.gms.nearby.connection.Strategy
-import org.json.JSONObject
+import com.google.android.gms.nearby.connection.*
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.InputStream
-import java.util.Date
-import java.util.UUID
-import kotlin.math.sqrt
+import java.io.Serializable
+import java.text.SimpleDateFormat
+import java.util.*
 
-class MainActivity : AppCompatActivity(), SensorEventListener {
+// --- DATA STRUCTURES ---
+enum class MessageType { TEXT, IMAGE, VOICE, LOCATION }
+enum class ChatType { PERSONAL, GROUP }
 
-    companion object {
-        private const val SERVICE_ID = "com.example.p2pmesh.SERVICE_ID"
-        private const val BROADCAST_TARGET = "BROADCAST"
-        private const val IMPACT_G_THRESHOLD = 4.5f
-    }
+data class MeshMessage(
+    val messageId: String = UUID.randomUUID().toString(),
+    val senderName: String,
+    val senderId: String,
+    val receiverId: String?, // Group Chat के लिए null
+    val chatType: ChatType,
+    val type: MessageType,
+    val content: String,
+    val timestamp: Long = System.currentTimeMillis()
+) : Serializable
 
-    private lateinit var connectionsClient: ConnectionsClient
-    private lateinit var sensorManager: SensorManager
-    private var accelerometer: Sensor? = null
+data class MeshPeer(
+    val endpointId: String,
+    val name: String
+)
 
-    private lateinit var etUserName: EditText
-    private lateinit var btnRegister: Button
-    private lateinit var rvPeers: RecyclerView
-    private lateinit var btnStartAdv: Button
-    private lateinit var btnStartDisc: Button
-    private lateinit var btnBroadcastSos: Button
-    private lateinit var btnSimulateImpact: Button
-    private lateinit var btnSendImage: Button
-    private lateinit var tvAuditLog: TextView
-    private lateinit var svAuditLog: ScrollView
+// --- MAIN ACTIVITY ---
+class MainActivity : ComponentActivity() {
 
-    private lateinit var peerAdapter: PeerAdapter
-    private val peerList = mutableListOf<Peer>()
-    private val connectedEndpoints = mutableMapOf<String, String>() // endpointId -> name
+    private var myUsername by mutableStateOf("Sarkar_" + Random().nextInt(1000))
+    private var myEndpointId by mutableStateOf("")
+    private val activePeers = mutableStateListOf<MeshPeer>()
+    private val messageHistory = mutableStateListOf<MeshMessage>()
+    private var selectedPeer by mutableStateOf<MeshPeer?>(null) // null = Group Chat
 
-    private var localUserName: String = "MeshNode_" + UUID.randomUUID().toString().take(4)
-    private var isRegistered: Boolean = false
-    private val seenPacketIds = mutableSetOf<String>()
-    private val chatHistories = mutableMapOf<String, StringBuilder>() // endpointId/name -> chat log
-
-    private var activeChatDialog: AlertDialog? = null
-    private var activeChatPeer: Peer? = null
-    private var activeChatHistoryTextView: TextView? = null
-
-    private var lastImpactTimestamp = 0L
-
-    private val imagePickerLauncher = registerForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let { sendImageFromUri(it) }
-    }
-
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.entries.all { it.value }
-        if (allGranted) {
-            logAudit("All required Bluetooth & Mesh permissions granted.")
-        } else {
-            logAudit("Warning: Some permissions were denied. Mesh discovery may be restricted.")
-        }
-    }
+    private val SERVICE_ID = "com.example.ss.P2P_MESH"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        connectionsClient = Nearby.getConnectionsClient(this)
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        requestPermissions()
 
-        initViews()
-        setupRecyclerView()
-        checkAndRequestPermissions()
-
-        logAudit("Initialization complete. Enter Peer Name and click Register & Join Mesh.")
-    }
-
-    private fun initViews() {
-        etUserName = findViewById(R.id.etUserName)
-        btnRegister = findViewById(R.id.btnRegister)
-        rvPeers = findViewById(R.id.rvPeers)
-        btnStartAdv = findViewById(R.id.btnStartAdv)
-        btnStartDisc = findViewById(R.id.btnStartDisc)
-        btnBroadcastSos = findViewById(R.id.btnBroadcastSos)
-        btnSimulateImpact = findViewById(R.id.btnSimulateImpact)
-        btnSendImage = findViewById(R.id.btnSendImage)
-        tvAuditLog = findViewById(R.id.tvAuditLog)
-        svAuditLog = findViewById(R.id.svAuditLog)
-
-        etUserName.setText(localUserName)
-
-        btnRegister.setOnClickListener {
-            val inputName = etUserName.text.toString().trim()
-            if (inputName.isNotEmpty()) {
-                localUserName = inputName
-                isRegistered = true
-                logAudit("Node Registered as: '$localUserName'. Auto-starting Advertising & Discovery.")
-                startAdvertising()
-                startDiscovery()
-            } else {
-                Toast.makeText(this, "Please enter a valid peer name", Toast.LENGTH_SHORT).show()
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                MainScreen(
+                    myUsername = myUsername,
+                    onUsernameChange = { myUsername = it },
+                    activePeers = activePeers,
+                    selectedPeer = selectedPeer,
+                    onSelectPeer = { selectedPeer = it },
+                    messages = messageHistory.filter {
+                        if (selectedPeer == null) {
+                            it.chatType == ChatType.GROUP
+                        } else {
+                            (it.senderId == selectedPeer?.endpointId || it.receiverId == selectedPeer?.endpointId)
+                        }
+                    },
+                    onSendMessage = { content, type ->
+                        sendMessage(content, type)
+                    },
+                    onStartMesh = {
+                        startAdvertising()
+                        startDiscovery()
+                    },
+                    onSendLocation = { shareLocation() }
+                )
             }
         }
-
-        btnStartAdv.setOnClickListener { startAdvertising() }
-        btnStartDisc.setOnClickListener { startDiscovery() }
-
-        btnBroadcastSos.setOnClickListener {
-            broadcastSosAlert("MANUAL EMERGENCY SOS BROADCAST")
-        }
-
-        btnSimulateImpact.setOnClickListener {
-            simulateImpactAccident()
-        }
-
-        btnSendImage.setOnClickListener {
-            imagePickerLauncher.launch("image/*")
-        }
     }
 
-    private fun setupRecyclerView() {
-        peerAdapter = PeerAdapter(peerList) { peer ->
-            openPrivateChatDialog(peer)
-        }
-        rvPeers.layoutManager = LinearLayoutManager(this)
-        rvPeers.adapter = peerAdapter
+    private fun requestPermissions() {
+        val permissions = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        )
+        requestPermissions(permissions, 101)
     }
 
-    // --- NEARBY CONNECTIONS MESH ENGINE ---
-
+    // --- NEARBY CONNECTIONS (P2P MESH ENGINE) ---
     private fun startAdvertising() {
-        val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        connectionsClient.startAdvertising(
-            localUserName,
-            SERVICE_ID,
-            connectionLifecycleCallback,
-            options
+        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        Nearby.getConnectionsClient(this).startAdvertising(
+            myUsername, SERVICE_ID, connectionLifecycleCallback, advertisingOptions
         ).addOnSuccessListener {
-            logAudit("ADVERTISING: Started successfully as '$localUserName'.")
-        }.addOnFailureListener { e ->
-            logAudit("ADVERTISING ERROR: ${e.localizedMessage}")
+            Toast.makeText(this, "Mesh Network Connected (Advertising)", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun startDiscovery() {
-        val options = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        connectionsClient.startDiscovery(
-            SERVICE_ID,
-            endpointDiscoveryCallback,
-            options
-        ).addOnSuccessListener {
-            logAudit("DISCOVERY: Started searching for mesh peers...")
-        }.addOnFailureListener { e ->
-            logAudit("DISCOVERY ERROR: ${e.localizedMessage}")
-        }
+        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        Nearby.getConnectionsClient(this).startDiscovery(
+            SERVICE_ID, endpointDiscoveryCallback, discoveryOptions
+        )
     }
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            logAudit("PEER DISCOVERED: ID=$endpointId, Name=${info.endpointName}")
-            addOrUpdatePeer(endpointId, info.endpointName, PeerStatus.DISCOVERED)
-
-            // Auto-request connection for seamless P2P mesh cluster
-            logAudit("Connecting to peer $endpointId...")
-            connectionsClient.requestConnection(localUserName, endpointId, connectionLifecycleCallback)
-                .addOnSuccessListener {
-                    addOrUpdatePeer(endpointId, info.endpointName, PeerStatus.CONNECTING)
-                }
-                .addOnFailureListener { e ->
-                    logAudit("Connection request to $endpointId failed: ${e.localizedMessage}")
-                }
+            Nearby.getConnectionsClient(this@MainActivity)
+                .requestConnection(myUsername, endpointId, connectionLifecycleCallback)
         }
 
         override fun onEndpointLost(endpointId: String) {
-            logAudit("PEER LOST: Endpoint $endpointId went out of range.")
-            addOrUpdatePeer(endpointId, connectedEndpoints[endpointId] ?: "Unknown", PeerStatus.DISCONNECTED)
+            activePeers.removeAll { it.endpointId == endpointId }
         }
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            logAudit("CONNECTION INITIATED: Accepting connection with ${info.endpointName} ($endpointId)")
-            connectionsClient.acceptConnection(endpointId, payloadCallback)
-            addOrUpdatePeer(endpointId, info.endpointName, PeerStatus.CONNECTING)
+            Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
+            val newPeer = MeshPeer(endpointId, info.endpointName)
+            if (!activePeers.contains(newPeer)) activePeers.add(newPeer)
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
-                val peerName = peerList.find { it.endpointId == endpointId }?.name ?: "Peer_$endpointId"
-                connectedEndpoints[endpointId] = peerName
-                addOrUpdatePeer(endpointId, peerName, PeerStatus.CONNECTED)
-                logAudit("MESH CONNECTED: Peer '$peerName' ($endpointId) joined local cluster.")
-                
-                // Send node announce packet
-                sendMeshPacket(
-                    targetEndpointId = BROADCAST_TARGET,
-                    type = "ANNOUNCE",
-                    content = "Node $localUserName online."
-                )
-            } else {
-                logAudit("CONNECTION REJECTED/FAILED with endpoint $endpointId")
-                addOrUpdatePeer(endpointId, "Unknown", PeerStatus.DISCONNECTED)
+                myEndpointId = endpointId
             }
         }
 
         override fun onDisconnected(endpointId: String) {
-            val peerName = connectedEndpoints.remove(endpointId) ?: "Unknown"
-            addOrUpdatePeer(endpointId, peerName, PeerStatus.DISCONNECTED)
-            logAudit("PEER DISCONNECTED: '$peerName' ($endpointId)")
+            activePeers.removeAll { it.endpointId == endpointId }
         }
     }
-
-    // --- PAYLOAD & MULTI-HOP MESH RELAY ENGINE ---
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            val bytes = payload.asBytes() ?: return
-            val jsonStr = String(bytes, Charsets.UTF_8)
-            try {
-                val packet = JSONObject(jsonStr)
-                val packetId = packet.getString("packetId")
-                val senderName = packet.getString("senderName")
-                val senderId = packet.getString("senderId")
-                val targetId = packet.getString("targetId")
-                val type = packet.getString("type")
-                val content = packet.getString("content")
-                val hopCount = packet.optInt("hopCount", 0)
-
-                // Deduplication Check
-                if (seenPacketIds.contains(packetId)) {
-                    return // Ignore duplicate packet
-                }
-                seenPacketIds.add(packetId)
-
-                logAudit("PAYLOAD RECEIVED [Type: $type] from $senderName (Hops: $hopCount)")
-
-                val isForMe = targetId == BROADCAST_TARGET || targetId == localUserName || targetId == getLocalEndpointId()
-
-                if (isForMe) {
-                    handleIncomingPacket(senderName, senderId, targetId, type, content)
-                }
-
-                // MULTI-HOP RELAY FORWARDING LOGIC
-                // Relay packet to all other connected peers except the immediate incoming sender
-                if (hopCount < 5) {
-                    relayPacketToCluster(packet, incomingSenderEndpoint = endpointId)
-                }
-
-            } catch (e: Exception) {
-                logAudit("ERROR parsing mesh payload: ${e.localizedMessage}")
-            }
-        }
-
-        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Optional transfer progress tracking
-        }
-    }
-
-    private fun handleIncomingPacket(senderName: String, senderId: String, targetId: String, type: String, content: String) {
-        when (type) {
-            "CHAT" -> {
-                appendChatMessage(senderId, senderName, "[$senderName]: $content")
-                logAudit("CHAT MSG from $senderName: $content")
-            }
-            "SOS" -> {
-                logAudit("🚨 SOS EMERGENCY ALERT from $senderName: $content")
-                showAlertModal("🚨 EMERGENCY SOS ALERT", "Received SOS from Mesh Peer '$senderName':\n\n$content")
-            }
-            "IMPACT" -> {
-                logAudit("💥 COLLISION IMPACT DETECTED on $senderName: $content")
-                showAlertModal("💥 VEHICLE CRASH DETECTED", "G-Force Impact threshold exceeded on peer '$senderName'!\nTelemetry: $content")
-            }
-            "IMAGE" -> {
-                logAudit("📸 IMAGE PAYLOAD received from $senderName (Base64 length: ${content.length})")
-                appendChatMessage(senderId, senderName, "[$senderName]: [Received Image - ${content.length / 1024} KB]")
-            }
-            "ANNOUNCE" -> {
-                logAudit("MESH ANNOUNCE: $content")
-            }
-        }
-    }
-
-    private fun relayPacketToCluster(packetJson: JSONObject, incomingSenderEndpoint: String) {
-        try {
-            val newHopCount = packetJson.optInt("hopCount", 0) + 1
-            packetJson.put("hopCount", newHopCount)
-            val jsonBytes = packetJson.toString().toByteArray(Charsets.UTF_8)
-
-            var relayCount = 0
-            for ((epId, _) in connectedEndpoints) {
-                if (epId != incomingSenderEndpoint) {
-                    connectionsClient.sendPayload(epId, Payload.fromBytes(jsonBytes))
-                    relayCount++
-                }
-            }
-            if (relayCount > 0) {
-                logAudit("FORWARDED/RELAYED packet ${packetJson.optString("packetId").take(8)} to $relayCount mesh peers.")
-            }
-        } catch (e: Exception) {
-            logAudit("Relay error: ${e.localizedMessage}")
-        }
-    }
-
-    private fun sendMeshPacket(targetEndpointId: String, type: String, content: String) {
-        val packetId = UUID.randomUUID().toString()
-        seenPacketIds.add(packetId)
-
-        val packet = JSONObject().apply {
-            put("packetId", packetId)
-            put("senderName", localUserName)
-            put("senderId", localUserName)
-            put("targetId", targetEndpointId)
-            put("type", type)
-            put("content", content)
-            put("hopCount", 0)
-        }
-
-        val bytes = packet.toString().toByteArray(Charsets.UTF_8)
-        val payload = Payload.fromBytes(bytes)
-
-        if (connectedEndpoints.isEmpty()) {
-            logAudit("WARNING: No connected peers to transmit packet ($type). Searching for peers...")
-            return
-        }
-
-        if (targetEndpointId == BROADCAST_TARGET) {
-            for ((epId, _) in connectedEndpoints) {
-                connectionsClient.sendPayload(epId, payload)
-            }
-            logAudit("BROADCAST SENT [Type: $type] to ${connectedEndpoints.size} peers.")
-        } else {
-            // Direct target endpoint
-            var sent = false
-            for ((epId, peerName) in connectedEndpoints) {
-                if (epId == targetEndpointId || peerName == targetEndpointId) {
-                    connectionsClient.sendPayload(epId, payload)
-                    sent = true
-                    logAudit("DIRECT PACKET SENT [Type: $type] to $peerName ($epId)")
-                    break
-                }
-            }
-            if (!sent) {
-                // Relay broadcast to reach non-adjacent target
-                for ((epId, _) in connectedEndpoints) {
-                    connectionsClient.sendPayload(epId, payload)
-                }
-                logAudit("RELAY PACKET DISPATCHED [Target: $targetEndpointId] across mesh cluster.")
-            }
-        }
-    }
-
-    private fun broadcastSosAlert(message: String) {
-        sendMeshPacket(BROADCAST_TARGET, "SOS", message)
-        logAudit("🚨 SOS BROADCAST DISPATCHED: $message")
-        Toast.makeText(this, "Emergency SOS Broadcast Sent!", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun simulateImpactAccident() {
-        val simulatedG = 6.8f
-        val crashTelemetry = "Simulated Collision Impact: ${simulatedG}G at ${DateFormat.format("HH:mm:ss", Date())}"
-        logAudit("💥 SENSOR CRASH SIMULATED: Force=${simulatedG}G")
-        sendMeshPacket(BROADCAST_TARGET, "IMPACT", crashTelemetry)
-        showAlertModal("💥 COLLISION IMPACT ALERT", "Simulated G-Force Accident Sensor Triggered!\n$crashTelemetry")
-    }
-
-    private fun sendImageFromUri(uri: Uri) {
-        try {
-            val inputStream: InputStream? = contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(inputStream)
-            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 300, 300, true)
-            val baos = ByteArrayOutputStream()
-            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-            val base64Image = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-
-            sendMeshPacket(BROADCAST_TARGET, "IMAGE", base64Image)
-            logAudit("📸 Image sent over mesh (${baos.size() / 1024} KB).")
-            Toast.makeText(this, "Mesh Image Transmitted", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            logAudit("Error processing image: ${e.localizedMessage}")
-        }
-    }
-
-    // --- ACCELEROMETER G-FORCE ACCIDENT SENSOR ---
-
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
-            val x = event.values[0]
-            val y = event.values[1]
-            val z = event.values[2]
-
-            val gForce = sqrt((x * x + y * y + z * z).toDouble()).toFloat() / SensorManager.GRAVITY_EARTH
-
-            if (gForce > IMPACT_G_THRESHOLD) {
-                val now = System.currentTimeMillis()
-                if (now - lastImpactTimestamp > 5000) { // 5s cooldown
-                    lastImpactTimestamp = now
-                    val telemetry = "Real Accelerometer Impact: ${"%.2f".format(gForce)}G"
-                    logAudit("💥 REAL ACCELEROMETER CRASH DETECTED! Telemetry: $telemetry")
-                    sendMeshPacket(BROADCAST_TARGET, "IMPACT", telemetry)
-                    sendMeshPacket(BROADCAST_TARGET, "SOS", "AUTOMATIC SOS: Impact Crash Detected ($telemetry)")
-                    showAlertModal("💥 REAL IMPACT DETECTED", "Accelerometer registered ${"%.2f".format(gForce)}G force!\nEmergency SOS auto-transmitted to mesh.")
+            payload.asBytes()?.let { bytes ->
+                val rawData = String(bytes, Charsets.UTF_8)
+                val parts = rawData.split("|", limit = 6)
+                if (parts.size == 6) {
+                    val msg = MeshMessage(
+                        type = MessageType.valueOf(parts[0]),
+                        senderName = parts[1],
+                        senderId = parts[2],
+                        receiverId = if (parts[3] == "null") null else parts[3],
+                        chatType = ChatType.valueOf(parts[4]),
+                        content = parts[5]
+                    )
+                    messageHistory.add(msg)
                 }
             }
         }
+
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    private fun sendMessage(content: String, type: MessageType) {
+        val chatType = if (selectedPeer == null) ChatType.GROUP else ChatType.PERSONAL
+        val receiverId = selectedPeer?.endpointId
 
-    // --- PRIVATE CHAT DIALOG ---
-
-    private fun openPrivateChatDialog(peer: Peer) {
-        activeChatPeer = peer
-        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_private_chat, null)
-        val tvChatTitle = dialogView.findViewById<TextView>(R.id.tvChatTitle)
-        val btnCloseChat = dialogView.findViewById<ImageButton>(R.id.btnCloseChat)
-        val tvChatHistory = dialogView.findViewById<TextView>(R.id.tvChatHistory)
-        val etChatMessage = dialogView.findViewById<EditText>(R.id.etChatMessage)
-        val btnSendChat = dialogView.findViewById<Button>(R.id.btnSendChat)
-
-        activeChatHistoryTextView = tvChatHistory
-        tvChatTitle.text = "Private Chat with ${peer.name}"
-
-        val key = peer.endpointId
-        val existingHistory = chatHistories.getOrPut(key) { StringBuilder("[Mesh Chat Session Established]\n") }
-        tvChatHistory.text = existingHistory.toString()
-
-        val dialog = AlertDialog.Builder(this)
-            .setView(dialogView)
-            .create()
-
-        activeChatDialog = dialog
-
-        btnCloseChat.setOnClickListener {
-            activeChatDialog?.dismiss()
-            activeChatPeer = null
-            activeChatHistoryTextView = null
-        }
-
-        btnSendChat.setOnClickListener {
-            val msg = etChatMessage.text.toString().trim()
-            if (msg.isNotEmpty()) {
-                sendMeshPacket(peer.endpointId, "CHAT", msg)
-                appendChatMessage(peer.endpointId, peer.name, "[Me]: $msg")
-                etChatMessage.setText("")
-            }
-        }
-
-        dialog.setOnDismissListener {
-            activeChatPeer = null
-            activeChatHistoryTextView = null
-        }
-
-        dialog.show()
-    }
-
-    private fun appendChatMessage(peerKey: String, peerName: String, formattedLine: String) {
-        val history = chatHistories.getOrPut(peerKey) { StringBuilder() }
-        history.append(formattedLine).append("\n")
-
-        if (activeChatPeer?.endpointId == peerKey || activeChatPeer?.name == peerName) {
-            runOnUiThread {
-                activeChatHistoryTextView?.text = history.toString()
-            }
-        }
-    }
-
-    // --- HELPERS & UTILS ---
-
-    private fun addOrUpdatePeer(endpointId: String, name: String, status: PeerStatus) {
-        runOnUiThread {
-            val existingIndex = peerList.indexOfFirst { it.endpointId == endpointId }
-            if (existingIndex >= 0) {
-                peerList[existingIndex].status = status
-                if (name != "Unknown") {
-                    peerList[existingIndex] = peerList[existingIndex].copy(name = name)
-                }
-            } else {
-                peerList.add(Peer(endpointId, name, status))
-            }
-            peerAdapter.updatePeers(peerList)
-        }
-    }
-
-    private fun logAudit(message: String) {
-        val timestamp = DateFormat.format("HH:mm:ss", Date())
-        val logLine = "[$timestamp] $message\n"
-        runOnUiThread {
-            tvAuditLog.append(logLine)
-            svAuditLog.post { svAuditLog.fullScroll(ScrollView.FOCUS_DOWN) }
-        }
-    }
-
-    private fun showAlertModal(title: String, message: String) {
-        runOnUiThread {
-            AlertDialog.Builder(this)
-                .setTitle(title)
-                .setMessage(message)
-                .setPositiveButton("OK") { d, _ -> d.dismiss() }
-                .show()
-        }
-    }
-
-    private fun getLocalEndpointId(): String = "LOCAL_NODE"
-
-    private fun checkAndRequestPermissions() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
+        val msg = MeshMessage(
+            senderName = myUsername,
+            senderId = myEndpointId.ifEmpty { "LOCAL" },
+            receiverId = receiverId,
+            chatType = chatType,
+            type = type,
+            content = content
         )
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
+        messageHistory.add(msg)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
-        }
+        val rawPayload = "${type.name}|${myUsername}|${myEndpointId}|${receiverId}|${chatType.name}|${content}"
+        val payload = Payload.fromBytes(rawPayload.toByteArray(Charsets.UTF_8))
 
-        val missing = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missing.isNotEmpty()) {
-            requestPermissionLauncher.launch(missing.toTypedArray())
+        if (chatType == ChatType.GROUP) {
+            activePeers.forEach { peer ->
+                Nearby.getConnectionsClient(this).sendPayload(peer.endpointId, payload)
+            }
+        } else {
+            receiverId?.let { id ->
+                Nearby.getConnectionsClient(this).sendPayload(id, payload)
+            }
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+    @SuppressLint("MissingPermission")
+    private fun shareLocation() {
+        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        fusedLocationClient.lastLocation.addOnSuccessListener { loc: Location? ->
+            if (loc != null) {
+                val locData = "https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
+                sendMessage("📍 Live Location: $locData", MessageType.LOCATION)
+            } else {
+                Toast.makeText(this, "GPS Signal Not Found!", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+// --- WHATSAPP-STYLE UI DESIGN ---
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(
+    myUsername: String,
+    onUsernameChange: (String) -> Unit,
+    activePeers: List<MeshPeer>,
+    selectedPeer: MeshPeer?,
+    onSelectPeer: (MeshPeer?) -> Unit,
+    messages: List<MeshMessage>,
+    onSendMessage: (String, MessageType) -> Unit,
+    onStartMesh: () -> Unit,
+    onSendLocation: () -> Unit
+) {
+    var textState by remember { mutableStateOf("") }
+    var showAttachmentMenu by remember { mutableStateOf(false) }
+    var isRecording by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+    var mediaRecorder: MediaRecorder? by remember { mutableStateOf(null) }
+    var audioFilePath by remember { mutableStateOf("") }
+
+    // Gallery Launcher
+    val galleryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let {
+            val base64Str = uriToBase64(context, it)
+            if (base64Str != null) {
+                onSendMessage(base64Str, MessageType.IMAGE)
+            }
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        sensorManager.unregisterListener(this)
-    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(
+                            text = selectedPeer?.name ?: "🌐 Mesh Group (Broadcast)",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (selectedPeer == null) "${activePeers.size} Peers Connected" else "Direct Mesh Chat",
+                            fontSize = 12.sp,
+                            color = Color.LightGray
+                        )
+                    }
+                },
+                actions = {
+                    Button(
+                        onClick = { onStartMesh() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366))
+                    ) {
+                        Text("Connect", color = Color.White)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF075E54))
+            )
+        }
+    ) { padding ->
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(Color(0xFF121B22))
+        ) {
+            // LEFT SIDEBAR: Active Peers List (जहाँ आपने टिक मारा था)
+            Column(
+                modifier = Modifier
+                    .width(150.dp)
+                    .fillMaxHeight()
+                    .background(Color(0xFF1F2C34))
+            ) {
+                OutlinedTextField(
+                    value = myUsername,
+                    onValueChange = onUsernameChange,
+                    label = { Text("My Nickname", fontSize = 10.sp) },
+                    modifier = Modifier.padding(6.dp),
+                    singleLine = true
+                )
 
-    override fun onDestroy() {
-        super.onDestroy()
-        connectionsClient.stopAdvertising()
-        connectionsClient.stopDiscovery()
-        connectionsClient.stopAllEndpoints()
+                HorizontalDivider(color = Color.Gray, thickness = 0.5.dp)
+
+                // Group Option
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(6.dp)
+                        .clickable { onSelectPeer(null) },
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (selectedPeer == null) Color(0xFF00A884) else Color(0xFF2A3942)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Groups, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("All Group", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                }
+
+                Text(
+                    text = "CONNECTED PEERS (${activePeers.size})",
+                    fontSize = 10.sp,
+                    color = Color.Gray,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+
+                // Individual Peers List
+                LazyColumn {
+                    items(activePeers) { peer ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                                .clickable { onSelectPeer(peer) },
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (selectedPeer?.endpointId == peer.endpointId) Color(0xFF00A884) else Color(0xFF2A3942)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.Green)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    peer.name,
+                                    fontSize = 12.sp,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // RIGHT CHAT AREA
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            ) {
+                // Messages List
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(8.dp),
+                    reverseLayout = false
+                ) {
+                    items(messages) { msg ->
+                        ChatBubble(msg, isMe = msg.senderName == myUsername)
+                    }
+                }
+
+                // Popup Attachment Menu (Gallery, Location, Voice)
+                if (showAttachmentMenu) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2C34))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            // Location Button
+                            IconButton(onClick = {
+                                onSendLocation()
+                                showAttachmentMenu = false
+                            }) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(Icons.Default.LocationOn, contentDescription = "Location", tint = Color(0xFF00E676))
+                                    Text("Location", fontSize = 10.sp, color = Color.White)
+                                }
+                            }
+
+                            // Gallery Button
+                            IconButton(onClick = {
+                                galleryLauncher.launch("image/*")
+                                showAttachmentMenu = false
+                            }) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(Icons.Default.Image, contentDescription = "Gallery", tint = Color(0xFF29B6F6))
+                                    Text("Gallery", fontSize = 10.sp, color = Color.White)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bottom Input Bar
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Attachment Icon (Pin)
+                    IconButton(onClick = { showAttachmentMenu = !showAttachmentMenu }) {
+                        Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = Color.Gray)
+                    }
+
+                    OutlinedTextField(
+                        value = textState,
+                        onValueChange = { textState = it },
+                        placeholder = { Text("Type message...") },
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(25.dp)),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = Color(0xFF1F2C34),
+                            unfocusedContainerColor = Color(0xFF1F2C34),
+                            focusedBorderColor = Color.Transparent,
+                            unfocusedBorderColor = Color.Transparent
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.width(4.dp))
+
+                    // Audio Record / Send Button
+                    if (textState.isNotBlank()) {
+                        FloatingActionButton(
+                            onClick = {
+                                onSendMessage(textState, MessageType.TEXT)
+                                textState = ""
+                            },
+                            containerColor = Color(0xFF00A884),
+                            shape = CircleShape,
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.Send, contentDescription = "Send", tint = Color.White)
+                        }
+                    } else {
+                        FloatingActionButton(
+                            onClick = {
+                                if (!isRecording) {
+                                    // Start Recording
+                                    audioFilePath = "${context.cacheDir.absolutePath}/voice_msg.3gp"
+                                    mediaRecorder = MediaRecorder().apply {
+                                        setAudioSource(MediaRecorder.AudioSource.MIC)
+                                        setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                                        setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                                        setOutputFile(audioFilePath)
+                                        prepare()
+                                        start()
+                                    }
+                                    isRecording = true
+                                    Toast.makeText(context, "Recording started...", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    // Stop Recording & Send
+                                    try {
+                                        mediaRecorder?.stop()
+                                        mediaRecorder?.release()
+                                        mediaRecorder = null
+                                        isRecording = false
+
+                                        val audioBytes = File(audioFilePath).readBytes()
+                                        val base64Audio = Base64.encodeToString(audioBytes, Base64.DEFAULT)
+                                        onSendMessage(base64Audio, MessageType.VOICE)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+                            },
+                            containerColor = if (isRecording) Color.Red else Color(0xFF00A884),
+                            shape = CircleShape,
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(
+                                if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
+                                contentDescription = "Mic",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- CHAT BUBBLE COMPONENT ---
+@Composable
+fun ChatBubble(message: MeshMessage, isMe: Boolean) {
+    val formatter = SimpleDateFormat("HH:mm", Locale.getDefault())
+    val timeString = formatter.format(Date(message.timestamp))
+    val context = LocalContext.current
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = if (isMe) Arrangement.End else Arrangement.Start
+    ) {
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isMe) Color(0xFF005C4B) else Color(0xFF202C33)
+            ),
+            modifier = Modifier.widthIn(max = 260.dp)
+        ) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                if (!isMe) {
+                    Text(
+                        text = message.senderName,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFFF8A65)
+                    )
+                }
+
+                when (message.type) {
+                    MessageType.TEXT -> {
+                        Text(text = message.content, color = Color.White, fontSize = 14.sp)
+                    }
+                    MessageType.LOCATION -> {
+                        Text(text = message.content, color = Color(0xFF00E676), fontSize = 13.sp)
+                    }
+                    MessageType.IMAGE -> {
+                        val bitmap = decodeBase64ToBitmap(message.content)
+                        bitmap?.let {
+                            Image(
+                                bitmap = it.asImageBitmap(),
+                                contentDescription = "Shared Image",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(180.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                            )
+                        }
+                    }
+                    MessageType.VOICE -> {
+                        var isPlaying by remember { mutableStateOf(false) }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(vertical = 4.dp)
+                        ) {
+                            IconButton(onClick = {
+                                try {
+                                    val audioBytes = Base64.decode(message.content, Base64.DEFAULT)
+                                    val tempFile = File.createTempFile("voice", "3gp", context.cacheDir)
+                                    val fos = FileOutputStream(tempFile)
+                                    fos.write(audioBytes)
+                                    fos.close()
+
+                                    val mediaPlayer = MediaPlayer().apply {
+                                        setDataSource(tempFile.absolutePath)
+                                        prepare()
+                                        start()
+                                    }
+                                    isPlaying = true
+                                    mediaPlayer.setOnCompletionListener {
+                                        isPlaying = false
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }) {
+                                Icon(
+                                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = "Play Audio",
+                                    tint = Color.Cyan
+                                )
+                            }
+                            Text(
+                                text = "Voice Message",
+                                color = Color.Cyan,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.align(Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = timeString,
+                        fontSize = 9.sp,
+                        color = Color.LightGray
+                    )
+                    if (isMe) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            Icons.Default.DoneAll,
+                            contentDescription = "Delivered",
+                            tint = Color(0xFF34B7F1),
+                            modifier = Modifier.size(12.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Utility Helpers
+fun decodeBase64ToBitmap(base64Str: String): Bitmap? {
+    return try {
+        val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+fun uriToBase64(context: Context, uri: Uri): String? {
+    return try {
+        val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
+        val bitmap = BitmapFactory.decodeStream(inputStream)
+        val byteArrayOutputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, byteArrayOutputStream)
+        val byteArray = byteArrayOutputStream.toByteArray()
+        Base64.encodeToString(byteArray, Base64.DEFAULT)
+    } catch (e: Exception) {
+        null
     }
 }
