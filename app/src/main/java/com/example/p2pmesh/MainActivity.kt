@@ -1,4 +1,4 @@
-package com.example.ss
+package com.example.p2pmesh
 
 import android.Manifest
 import android.annotation.SuppressLint
