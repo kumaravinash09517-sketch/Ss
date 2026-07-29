@@ -1,17 +1,17 @@
 package com.example.p2pmesh
 
 import android.Manifest
-import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.location.Location
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.util.Base64
+import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -23,7 +23,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -34,618 +33,594 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.core.content.ContextCompat
+import androidx.room.*
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.Serializable
-import java.text.SimpleDateFormat
-import java.util.*
 
-// --- DATA STRUCTURES ---
-enum class MessageType { TEXT, IMAGE, VOICE, LOCATION }
-enum class ChatType { PERSONAL, GROUP }
+// ==========================================
+// 1. ROOM DATABASE SETUP (PERMANENT HISTORY)
+// ==========================================
 
-data class MeshMessage(
-    val messageId: String = UUID.randomUUID().toString(),
-    val senderName: String,
-    val senderId: String,
-    val receiverId: String?, // Group Chat के लिए null
-    val chatType: ChatType,
-    val type: MessageType,
-    val content: String,
-    val timestamp: Long = System.currentTimeMillis()
-) : Serializable
-
-data class MeshPeer(
-    val endpointId: String,
-    val name: String
+@Entity(tableName = "messages")
+data class ChatMessage(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val sender: String,
+    val text: String = "",
+    val isMe: Boolean,
+    val time: String,
+    val type: String = "TEXT", // TEXT, IMAGE, VOICE, LOCATION, VIDEO
+    val localFilePath: String? = null
 )
 
-// --- MAIN ACTIVITY ---
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages ORDER BY id ASC")
+    fun getAllMessages(): Flow<List<ChatMessage>>
+
+    @Insert
+    suspend fun insertMessage(message: ChatMessage)
+}
+
+@Database(entities = [ChatMessage::class], version = 1, exportSchema = false)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun messageDao(): MessageDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: AppDatabase? = null
+
+        fun getDatabase(context: Context): AppDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "p2p_chat_history.db"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+// ==========================================
+// 2. MAIN ACTIVITY
+// ==========================================
+
 class MainActivity : ComponentActivity() {
 
-    private var myUsername by mutableStateOf("Sarkar_" + Random().nextInt(1000))
-    private var myEndpointId by mutableStateOf("")
-    private val activePeers = mutableStateListOf<MeshPeer>()
-    private val messageHistory = mutableStateListOf<MeshMessage>()
-    private var selectedPeer by mutableStateOf<MeshPeer?>(null) // null = Group Chat
-
-    private val SERVICE_ID = "com.example.ss.P2P_MESH"
+    private val SERVICE_ID = "com.example.p2pmesh.SERVICE"
+    private var myNickname = "Sarkar_702"
+    
+    // Direct or Indirect Network Peers List
+    private val connectedPeersMap = mutableStateMapOf<String, String>() // EndpointId -> Nickname
+    
+    private lateinit var db: AppDatabase
+    private var mediaRecorder: MediaRecorder? = null
+    private var audioFilePath: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        
+        db = AppDatabase.getDatabase(this)
         requestPermissions()
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                MainScreen(
-                    myUsername = myUsername,
-                    onUsernameChange = { myUsername = it },
-                    activePeers = activePeers,
-                    selectedPeer = selectedPeer,
-                    onSelectPeer = { selectedPeer = it },
-                    messages = messageHistory.filter {
-                        if (selectedPeer == null) {
-                            it.chatType == ChatType.GROUP
-                        } else {
-                            (it.senderId == selectedPeer?.endpointId || it.receiverId == selectedPeer?.endpointId)
-                        }
-                    },
-                    onSendMessage = { content, type ->
-                        sendMessage(content, type)
-                    },
-                    onStartMesh = {
-                        startAdvertising()
-                        startDiscovery()
-                    },
-                    onSendLocation = { shareLocation() }
-                )
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = Color(0xFF111B21)
+                ) {
+                    val messageList by db.messageDao().getAllMessages().collectAsState(initial = emptyList())
+                    val activePeerList = connectedPeersMap.values.toList()
+
+                    MainChatScreen(
+                        nickname = myNickname,
+                        connectedPeers = activePeerList,
+                        messages = messageList,
+                        onConnectClick = { startNearby() },
+                        onSendText = { sendTextMessage(it) },
+                        onSendLocation = { sendLiveLocation() },
+                        onRecordVoice = { startRecording() },
+                        onStopRecordVoice = { stopRecordingAndSend() },
+                        onSendMedia = { uri, type -> sendMediaFile(uri, type) }
+                    )
+                }
             }
         }
     }
 
     private fun requestPermissions() {
-        val permissions = arrayOf(
+        val permissions = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
             Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CAMERA,
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_ADVERTISE,
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.NEARBY_WIFI_DEVICES
+            Manifest.permission.CAMERA
         )
-        requestPermissions(permissions, 101)
-    }
-
-    // --- NEARBY CONNECTIONS (P2P MESH ENGINE) ---
-    private fun startAdvertising() {
-        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        Nearby.getConnectionsClient(this).startAdvertising(
-            myUsername, SERVICE_ID, connectionLifecycleCallback, advertisingOptions
-        ).addOnSuccessListener {
-            Toast.makeText(this, "Mesh Network Connected (Advertising)", Toast.LENGTH_SHORT).show()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
+        }
+        requestPermissions(permissions.toTypedArray(), 101)
     }
 
-    private fun startDiscovery() {
+    private fun startNearby() {
+        val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        Nearby.getConnectionsClient(this)
+            .startAdvertising(myNickname, SERVICE_ID, connectionLifecycleCallback, options)
+
         val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        Nearby.getConnectionsClient(this).startDiscovery(
-            SERVICE_ID, endpointDiscoveryCallback, discoveryOptions
-        )
+        Nearby.getConnectionsClient(this)
+            .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discoveryOptions)
+
+        Toast.makeText(this, "Searching Nearby Peers...", Toast.LENGTH_SHORT).show()
     }
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             Nearby.getConnectionsClient(this@MainActivity)
-                .requestConnection(myUsername, endpointId, connectionLifecycleCallback)
+                .requestConnection(myNickname, endpointId, connectionLifecycleCallback)
         }
-
-        override fun onEndpointLost(endpointId: String) {
-            activePeers.removeAll { it.endpointId == endpointId }
-        }
+        override fun onEndpointLost(endpointId: String) {}
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
-        override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
+        override fun onInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+            connectedPeersMap[endpointId] = connectionInfo.endpointName
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
-            val newPeer = MeshPeer(endpointId, info.endpointName)
-            if (!activePeers.contains(newPeer)) activePeers.add(newPeer)
         }
-
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
-                myEndpointId = endpointId
+                Toast.makeText(this@MainActivity, "Connected!", Toast.LENGTH_SHORT).show()
+                broadcastMyPeerList()
+            } else {
+                connectedPeersMap.remove(endpointId)
             }
         }
-
         override fun onDisconnected(endpointId: String) {
-            activePeers.removeAll { it.endpointId == endpointId }
+            connectedPeersMap.remove(endpointId)
+            broadcastMyPeerList()
         }
     }
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             payload.asBytes()?.let { bytes ->
-                val rawData = String(bytes, Charsets.UTF_8)
-                val parts = rawData.split("|", limit = 6)
-                if (parts.size == 6) {
-                    val msg = MeshMessage(
-                        type = MessageType.valueOf(parts[0]),
-                        senderName = parts[1],
-                        senderId = parts[2],
-                        receiverId = if (parts[3] == "null") null else parts[3],
-                        chatType = ChatType.valueOf(parts[4]),
-                        content = parts[5]
+                val strData = String(bytes)
+                val parts = strData.split("||")
+                val type = parts.getOrNull(0) ?: "TEXT"
+                val senderName = parts.getOrNull(1) ?: "Peer"
+                val content = parts.getOrNull(2) ?: ""
+
+                // 🌐 PEER LIST PROPAGATION (Mesh Peer Sync)
+                if (type == "PEER_SYNC") {
+                    val sharedPeers = content.split(",")
+                    for (peerName in sharedPeers) {
+                        if (peerName.isNotBlank() && peerName != myNickname && !connectedPeersMap.containsValue(peerName)) {
+                            connectedPeersMap["mesh_${peerName}"] = "$peerName (via Mesh)"
+                        }
+                    }
+                    return@let
+                }
+
+                val time = getCurrentTime()
+
+                CoroutineScope(Dispatchers.IO).launch {
+                    val msg = ChatMessage(
+                        sender = senderName,
+                        text = if (type == "TEXT" || type == "LOCATION") content else "",
+                        isMe = false,
+                        time = time,
+                        type = type,
+                        localFilePath = if (type != "TEXT" && type != "LOCATION") saveIncomingFile(content, type) else null
                     )
-                    messageHistory.add(msg)
+                    db.messageDao().insertMessage(msg)
+                }
+            }
+        }
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
+    }
+
+    private fun broadcastMyPeerList() {
+        val allPeerNames = connectedPeersMap.values.joinToString(",")
+        val syncData = "PEER_SYNC||$myNickname||$allPeerNames"
+        broadcastPayload(syncData)
+    }
+
+    private fun sendTextMessage(text: String) {
+        if (text.isBlank()) return
+        val payloadData = "TEXT||$myNickname||$text"
+        broadcastPayload(payloadData)
+        saveMessageToDb(ChatMessage(sender = myNickname, text = text, isMe = true, time = getCurrentTime(), type = "TEXT"))
+    }
+
+    private fun sendLiveLocation() {
+        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                if (loc != null) {
+                    val locUrl = "https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
+                    val payloadData = "LOCATION||$myNickname||$locUrl"
+                    broadcastPayload(payloadData)
+                    saveMessageToDb(ChatMessage(sender = myNickname, text = locUrl, isMe = true, time = getCurrentTime(), type = "LOCATION"))
+                }
+            }
+        }
+    }
+
+    private fun sendMediaFile(uri: Uri, type: String) {
+        try {
+            val inputStream: InputStream? = contentResolver.openInputStream(uri)
+            val bytes = inputStream?.readBytes()
+            inputStream?.close()
+
+            if (bytes != null) {
+                val base64Str = android.util.Base64.encodeToString(bytes, android.util.Base64.DEFAULT)
+                val payloadData = "$type||$myNickname||$base64Str"
+                broadcastPayload(payloadData)
+
+                val file = File(cacheDir, "sent_${System.currentTimeMillis()}.${if(type == "IMAGE") "jpg" else "mp4"}")
+                FileOutputStream(file).use { it.write(bytes) }
+
+                saveMessageToDb(ChatMessage(
+                    sender = myNickname,
+                    isMe = true,
+                    time = getCurrentTime(),
+                    type = type,
+                    localFilePath = file.absolutePath
+                ))
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Failed to send file", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun startRecording() {
+        val file = File(cacheDir, "audio_${System.currentTimeMillis()}.3gp")
+        audioFilePath = file.absolutePath
+        mediaRecorder = MediaRecorder().apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+            setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+            setOutputFile(audioFilePath)
+            prepare()
+            start()
+        }
+    }
+
+    private fun stopRecordingAndSend() {
+        try {
+            mediaRecorder?.stop()
+            mediaRecorder?.release()
+            mediaRecorder = null
+
+            val file = File(audioFilePath)
+            if (file.exists()) {
+                val bytes = file.readBytes()
+                val base64Str = android.util.Base64.encodeToString(bytes, android.util.Base64.DEFAULT)
+                broadcastPayload("VOICE||$myNickname||$base64Str")
+                
+                saveMessageToDb(ChatMessage(
+                    sender = myNickname,
+                    isMe = true,
+                    time = getCurrentTime(),
+                    type = "VOICE",
+                    localFilePath = audioFilePath
+                ))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun broadcastPayload(data: String) {
+        val payload = Payload.fromBytes(data.toByteArray())
+        for (peerId in connectedPeersMap.keys) {
+            if (!peerId.startsWith("mesh_")) { // Only send directly to physical connections
+                Nearby.getConnectionsClient(this).sendPayload(peerId, payload)
+            }
+        }
+    }
+
+    private fun saveMessageToDb(msg: ChatMessage) {
+        CoroutineScope(Dispatchers.IO).launch {
+            db.messageDao().insertMessage(msg)
+        }
+    }
+
+    private fun saveIncomingFile(base64Str: String, type: String): String {
+        val bytes = android.util.Base64.decode(base64Str, android.util.Base64.DEFAULT)
+        val ext = when(type) {
+            "IMAGE" -> "jpg"
+            "VIDEO" -> "mp4"
+            else -> "3gp"
+        }
+        val file = File(filesDir, "received_${System.currentTimeMillis()}.$ext")
+        FileOutputStream(file).use { it.write(bytes) }
+        return file.absolutePath
+    }
+
+    private fun getCurrentTime(): String {
+        return java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+    }
+}
+
+// ==========================================
+// 3. COMPOSE UI COMPONENTS
+// ==========================================
+
+@Composable
+fun MainChatScreen(
+    nickname: String,
+    connectedPeers: List<String>,
+    messages: List<ChatMessage>,
+    onConnectClick: () -> Unit,
+    onSendText: (String) -> Unit,
+    onSendLocation: () -> Unit,
+    onRecordVoice: () -> Unit,
+    onStopRecordVoice: () -> Unit,
+    onSendMedia: (Uri, String) -> Unit
+) {
+    var textState by remember { mutableStateOf("") }
+    var isRecording by remember { mutableStateOf(false) }
+    var selectedMediaForView by remember { mutableStateOf<ChatMessage?>(null) }
+
+    val imageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { onSendMedia(it, "IMAGE") }
+    }
+    val videoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { onSendMedia(it, "VIDEO") }
+    }
+
+    selectedMediaForView?.let { msg ->
+        MediaViewerDialog(msg = msg, onDismiss = { selectedMediaForView = null })
+    }
+
+    Row(modifier = Modifier.fillMaxSize()) {
+        // Left Sidebar
+        Column(
+            modifier = Modifier
+                .width(140.dp)
+                .fillMaxHeight()
+                .background(Color(0xFF111B21))
+                .padding(8.dp)
+        ) {
+            OutlinedTextField(
+                value = nickname,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("My Nickname", color = Color.Gray) },
+                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Color(0xFF00A884))
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Button(
+                onClick = onConnectClick,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00A884)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Connect")
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("CONNECTED PEERS (${connectedPeers.size})", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+            
+            LazyColumn(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                items(connectedPeers) { peer ->
+                    Text(
+                        text = "• $peer",
+                        color = Color(0xFF81D4FA),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
                 }
             }
         }
 
-        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
-    }
-
-    private fun sendMessage(content: String, type: MessageType) {
-        val chatType = if (selectedPeer == null) ChatType.GROUP else ChatType.PERSONAL
-        val receiverId = selectedPeer?.endpointId
-
-        val msg = MeshMessage(
-            senderName = myUsername,
-            senderId = myEndpointId.ifEmpty { "LOCAL" },
-            receiverId = receiverId,
-            chatType = chatType,
-            type = type,
-            content = content
-        )
-
-        messageHistory.add(msg)
-
-        val rawPayload = "${type.name}|${myUsername}|${myEndpointId}|${receiverId}|${chatType.name}|${content}"
-        val payload = Payload.fromBytes(rawPayload.toByteArray(Charsets.UTF_8))
-
-        if (chatType == ChatType.GROUP) {
-            activePeers.forEach { peer ->
-                Nearby.getConnectionsClient(this).sendPayload(peer.endpointId, payload)
+        // Chat Screen
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .background(Color(0xFF0B141A))
+        ) {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(8.dp)
+            ) {
+                items(messages) { msg ->
+                    ChatBubbleItem(msg = msg, onClick = { selectedMediaForView = msg })
+                }
             }
-        } else {
-            receiverId?.let { id ->
-                Nearby.getConnectionsClient(this).sendPayload(id, payload)
-            }
-        }
-    }
 
-    @SuppressLint("MissingPermission")
-    private fun shareLocation() {
-        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        fusedLocationClient.lastLocation.addOnSuccessListener { loc: Location? ->
-            if (loc != null) {
-                val locData = "https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
-                sendMessage("📍 Live Location: $locData", MessageType.LOCATION)
-            } else {
-                Toast.makeText(this, "GPS Signal Not Found!", Toast.LENGTH_SHORT).show()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { imageLauncher.launch("image/*") }) {
+                    Icon(Icons.Default.Share, contentDescription = "Photo", tint = Color.Gray)
+                }
+                IconButton(onClick = { videoLauncher.launch("video/*") }) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Video", tint = Color.Gray)
+                }
+                IconButton(onClick = onSendLocation) {
+                    Icon(Icons.Default.LocationOn, contentDescription = "Location", tint = Color.Gray)
+                }
+
+                OutlinedTextField(
+                    value = textState,
+                    onValueChange = { textState = it },
+                    placeholder = { Text("Type message...") },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Color(0xFF00A884))
+                )
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                if (textState.isNotBlank()) {
+                    IconButton(onClick = {
+                        onSendText(textState)
+                        textState = ""
+                    }) {
+                        Icon(Icons.Default.Send, contentDescription = "Send", tint = Color(0xFF00A884))
+                    }
+                } else {
+                    IconButton(
+                        onClick = {
+                            if (isRecording) {
+                                onStopRecordVoice()
+                                isRecording = false
+                            } else {
+                                onRecordVoice()
+                                isRecording = true
+                            }
+                        }
+                    ) {
+                        Icon(
+                            Icons.Default.Mic,
+                            contentDescription = "Voice",
+                            tint = if (isRecording) Color.Red else Color(0xFF00A884)
+                        )
+                    }
+                }
             }
         }
     }
 }
 
-// --- WHATSAPP-STYLE UI DESIGN ---
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(
-    myUsername: String,
-    onUsernameChange: (String) -> Unit,
-    activePeers: List<MeshPeer>,
-    selectedPeer: MeshPeer?,
-    onSelectPeer: (MeshPeer?) -> Unit,
-    messages: List<MeshMessage>,
-    onSendMessage: (String, MessageType) -> Unit,
-    onStartMesh: () -> Unit,
-    onSendLocation: () -> Unit
-) {
-    var textState by remember { mutableStateOf("") }
-    var showAttachmentMenu by remember { mutableStateOf(false) }
-    var isRecording by remember { mutableStateOf(false) }
+fun ChatBubbleItem(msg: ChatMessage, onClick: () -> Unit) {
+    val alignment = if (msg.isMe) Alignment.End else Alignment.Start
+    val bgColor = if (msg.isMe) Color(0xFF005C4B) else Color(0xFF202C33)
 
-    val context = LocalContext.current
-    var mediaRecorder: MediaRecorder? by remember { mutableStateOf(null) }
-    var audioFilePath by remember { mutableStateOf("") }
-
-    // Gallery Launcher
-    val galleryLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            val base64Str = uriToBase64(context, it)
-            if (base64Str != null) {
-                onSendMessage(base64Str, MessageType.IMAGE)
-            }
-        }
-    }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            text = selectedPeer?.name ?: "🌐 Mesh Group (Broadcast)",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = if (selectedPeer == null) "${activePeers.size} Peers Connected" else "Direct Mesh Chat",
-                            fontSize = 12.sp,
-                            color = Color.LightGray
-                        )
-                    }
-                },
-                actions = {
-                    Button(
-                        onClick = { onStartMesh() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366))
-                    ) {
-                        Text("Connect", color = Color.White)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF075E54))
-            )
-        }
-    ) { padding ->
-        Row(
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalAlignment = alignment
+    ) {
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(Color(0xFF121B22))
+                .clip(RoundedCornerShape(12.dp))
+                .background(bgColor)
+                .clickable { onClick() }
+                .padding(10.dp)
         ) {
-            // LEFT SIDEBAR: Active Peers List (जहाँ आपने टिक मारा था)
-            Column(
-                modifier = Modifier
-                    .width(150.dp)
-                    .fillMaxHeight()
-                    .background(Color(0xFF1F2C34))
-            ) {
-                OutlinedTextField(
-                    value = myUsername,
-                    onValueChange = onUsernameChange,
-                    label = { Text("My Nickname", fontSize = 10.sp) },
-                    modifier = Modifier.padding(6.dp),
-                    singleLine = true
-                )
+            Column {
+                if (!msg.isMe) {
+                    Text(text = msg.sender, color = Color(0xFFE57373), style = MaterialTheme.typography.labelSmall)
+                }
 
-                HorizontalDivider(color = Color.Gray, thickness = 0.5.dp)
-
-                // Group Option
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(6.dp)
-                        .clickable { onSelectPeer(null) },
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (selectedPeer == null) Color(0xFF00A884) else Color(0xFF2A3942)
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier.padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                when (msg.type) {
+                    "TEXT" -> Text(text = msg.text, color = Color.White)
+                    "LOCATION" -> Text(text = "📍 Live Location:\n${msg.text}", color = Color(0xFF81D4FA))
+                    "IMAGE" -> {
+                        msg.localFilePath?.let { path ->
+                            val bitmap = BitmapFactory.decodeFile(path)
+                            bitmap?.let {
+                                Image(
+                                    bitmap = it.asImageBitmap(),
+                                    contentDescription = "Image",
+                                    modifier = Modifier.size(180.dp).clip(RoundedCornerShape(8.dp)),
+                                    contentScale = ContentScale.Crop
+                                )
+                            }
+                        } ?: Text("📷 Photo Received", color = Color.White)
+                    }
+                    "VIDEO" -> Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Video File (Tap to view)", color = Color.White)
+                    }
+                    "VOICE" -> Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable {
+                            msg.localFilePath?.let { path ->
+                                val mp = MediaPlayer()
+                                mp.setDataSource(path)
+                                mp.prepare()
+                                mp.start()
+                            }
+                        }
                     ) {
-                        Icon(Icons.Default.Groups, contentDescription = null, tint = Color.White)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("All Group", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Voice Message (Tap to Play)", color = Color.White)
                     }
                 }
 
                 Text(
-                    text = "CONNECTED PEERS (${activePeers.size})",
-                    fontSize = 10.sp,
+                    text = msg.time,
                     color = Color.Gray,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.align(Alignment.End)
                 )
-
-                // Individual Peers List
-                LazyColumn {
-                    items(activePeers) { peer ->
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 4.dp, vertical = 2.dp)
-                                .clickable { onSelectPeer(peer) },
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (selectedPeer?.endpointId == peer.endpointId) Color(0xFF00A884) else Color(0xFF2A3942)
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .clip(CircleShape)
-                                        .background(Color.Green)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    peer.name,
-                                    fontSize = 12.sp,
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Medium
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // RIGHT CHAT AREA
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-            ) {
-                // Messages List
-                LazyColumn(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(8.dp),
-                    reverseLayout = false
-                ) {
-                    items(messages) { msg ->
-                        ChatBubble(msg, isMe = msg.senderName == myUsername)
-                    }
-                }
-
-                // Popup Attachment Menu (Gallery, Location, Voice)
-                if (showAttachmentMenu) {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2C34))
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceEvenly
-                        ) {
-                            // Location Button
-                            IconButton(onClick = {
-                                onSendLocation()
-                                showAttachmentMenu = false
-                            }) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Icon(Icons.Default.LocationOn, contentDescription = "Location", tint = Color(0xFF00E676))
-                                    Text("Location", fontSize = 10.sp, color = Color.White)
-                                }
-                            }
-
-                            // Gallery Button
-                            IconButton(onClick = {
-                                galleryLauncher.launch("image/*")
-                                showAttachmentMenu = false
-                            }) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Icon(Icons.Default.Image, contentDescription = "Gallery", tint = Color(0xFF29B6F6))
-                                    Text("Gallery", fontSize = 10.sp, color = Color.White)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Bottom Input Bar
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Attachment Icon (Pin)
-                    IconButton(onClick = { showAttachmentMenu = !showAttachmentMenu }) {
-                        Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = Color.Gray)
-                    }
-
-                    OutlinedTextField(
-                        value = textState,
-                        onValueChange = { textState = it },
-                        placeholder = { Text("Type message...") },
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(25.dp)),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = Color(0xFF1F2C34),
-                            unfocusedContainerColor = Color(0xFF1F2C34),
-                            focusedBorderColor = Color.Transparent,
-                            unfocusedBorderColor = Color.Transparent
-                        )
-                    )
-
-                    Spacer(modifier = Modifier.width(4.dp))
-
-                    // Audio Record / Send Button
-                    if (textState.isNotBlank()) {
-                        FloatingActionButton(
-                            onClick = {
-                                onSendMessage(textState, MessageType.TEXT)
-                                textState = ""
-                            },
-                            containerColor = Color(0xFF00A884),
-                            shape = CircleShape,
-                            modifier = Modifier.size(48.dp)
-                        ) {
-                            Icon(Icons.Default.Send, contentDescription = "Send", tint = Color.White)
-                        }
-                    } else {
-                        FloatingActionButton(
-                            onClick = {
-                                if (!isRecording) {
-                                    // Start Recording
-                                    audioFilePath = "${context.cacheDir.absolutePath}/voice_msg.3gp"
-                                    mediaRecorder = MediaRecorder().apply {
-                                        setAudioSource(MediaRecorder.AudioSource.MIC)
-                                        setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
-                                        setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
-                                        setOutputFile(audioFilePath)
-                                        prepare()
-                                        start()
-                                    }
-                                    isRecording = true
-                                    Toast.makeText(context, "Recording started...", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    // Stop Recording & Send
-                                    try {
-                                        mediaRecorder?.stop()
-                                        mediaRecorder?.release()
-                                        mediaRecorder = null
-                                        isRecording = false
-
-                                        val audioBytes = File(audioFilePath).readBytes()
-                                        val base64Audio = Base64.encodeToString(audioBytes, Base64.DEFAULT)
-                                        onSendMessage(base64Audio, MessageType.VOICE)
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
-                                    }
-                                }
-                            },
-                            containerColor = if (isRecording) Color.Red else Color(0xFF00A884),
-                            shape = CircleShape,
-                            modifier = Modifier.size(48.dp)
-                        ) {
-                            Icon(
-                                if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
-                                contentDescription = "Mic",
-                                tint = Color.White
-                            )
-                        }
-                    }
-                }
             }
         }
     }
 }
 
-// --- CHAT BUBBLE COMPONENT ---
 @Composable
-fun ChatBubble(message: MeshMessage, isMe: Boolean) {
-    val formatter = SimpleDateFormat("HH:mm", Locale.getDefault())
-    val timeString = formatter.format(Date(message.timestamp))
+fun MediaViewerDialog(msg: ChatMessage, onDismiss: () -> Unit) {
     val context = LocalContext.current
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = if (isMe) Arrangement.End else Arrangement.Start
-    ) {
+    Dialog(onDismissRequest = onDismiss) {
         Card(
-            shape = RoundedCornerShape(12.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = if (isMe) Color(0xFF005C4B) else Color(0xFF202C33)
-            ),
-            modifier = Modifier.widthIn(max = 260.dp)
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF111B21))
         ) {
-            Column(modifier = Modifier.padding(8.dp)) {
-                if (!isMe) {
-                    Text(
-                        text = message.senderName,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFFF8A65)
-                    )
-                }
-
-                when (message.type) {
-                    MessageType.TEXT -> {
-                        Text(text = message.content, color = Color.White, fontSize = 14.sp)
-                    }
-                    MessageType.LOCATION -> {
-                        Text(text = message.content, color = Color(0xFF00E676), fontSize = 13.sp)
-                    }
-                    MessageType.IMAGE -> {
-                        val bitmap = decodeBase64ToBitmap(message.content)
-                        bitmap?.let {
-                            Image(
-                                bitmap = it.asImageBitmap(),
-                                contentDescription = "Shared Image",
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(180.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                            )
-                        }
-                    }
-                    MessageType.VOICE -> {
-                        var isPlaying by remember { mutableStateOf(false) }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(vertical = 4.dp)
-                        ) {
-                            IconButton(onClick = {
-                                try {
-                                    val audioBytes = Base64.decode(message.content, Base64.DEFAULT)
-                                    val tempFile = File.createTempFile("voice", "3gp", context.cacheDir)
-                                    val fos = FileOutputStream(tempFile)
-                                    fos.write(audioBytes)
-                                    fos.close()
-
-                                    val mediaPlayer = MediaPlayer().apply {
-                                        setDataSource(tempFile.absolutePath)
-                                        prepare()
-                                        start()
-                                    }
-                                    isPlaying = true
-                                    mediaPlayer.setOnCompletionListener {
-                                        isPlaying = false
-                                    }
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
-                                }
-                            }) {
-                                Icon(
-                                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = "Play Audio",
-                                    tint = Color.Cyan
-                                )
-                            }
-                            Text(
-                                text = "Voice Message",
-                                color = Color.Cyan,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.align(Alignment.End),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = timeString,
-                        fontSize = 9.sp,
-                        color = Color.LightGray
-                    )
-                    if (isMe) {
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Icon(
-                            Icons.Default.DoneAll,
-                            contentDescription = "Delivered",
-                            tint = Color(0xFF34B7F1),
-                            modifier = Modifier.size(12.dp)
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (msg.type == "IMAGE" && msg.localFilePath != null) {
+                    val bitmap = BitmapFactory.decodeFile(msg.localFilePath)
+                    bitmap?.let {
+                        Image(
+                            bitmap = it.asImageBitmap(),
+                            contentDescription = "Preview",
+                            modifier = Modifier.fillMaxWidth().height(300.dp),
+                            contentScale = ContentScale.Fit
                         )
+                    }
+                } else if (msg.type == "VIDEO") {
+                    Text("🎥 Video File Received", color = Color.White)
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                    Button(onClick = onDismiss) { Text("Close") }
+                    Button(
+                        onClick = {
+                            msg.localFilePath?.let { path ->
+                                saveFileToGallery(context, path, msg.type)
+                                Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00A884))
+                    ) {
+                        Text("Save to Gallery")
                     }
                 }
             }
@@ -653,25 +628,19 @@ fun ChatBubble(message: MeshMessage, isMe: Boolean) {
     }
 }
 
-// Utility Helpers
-fun decodeBase64ToBitmap(base64Str: String): Bitmap? {
-    return try {
-        val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
-    } catch (e: Exception) {
-        null
+fun saveFileToGallery(context: Context, filePath: String, type: String) {
+    val file = File(filePath)
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+        put(MediaStore.MediaColumns.MIME_TYPE, if (type == "IMAGE") "image/jpeg" else "video/mp4")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/SarkarMesh")
+        }
     }
-}
-
-fun uriToBase64(context: Context, uri: Uri): String? {
-    return try {
-        val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
-        val bitmap = BitmapFactory.decodeStream(inputStream)
-        val byteArrayOutputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, byteArrayOutputStream)
-        val byteArray = byteArrayOutputStream.toByteArray()
-        Base64.encodeToString(byteArray, Base64.DEFAULT)
-    } catch (e: Exception) {
-        null
+    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+    uri?.let {
+        context.contentResolver.openOutputStream(it)?.use { outputStream ->
+            outputStream.write(file.readBytes())
+        }
     }
 }
